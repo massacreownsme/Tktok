@@ -1,0 +1,107 @@
+name: Build Android APK from uploaded ZIP
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_path:
+        description: "Path to project ZIP in this repository (example: uploads/TikTokGlass-Starter.zip)"
+        required: true
+        default: "uploads/TikTokGlass-Starter.zip"
+      gradle_task:
+        description: "Gradle task to run"
+        required: true
+        default: "assembleDebug"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Verify ZIP exists
+        env:
+          ZIP_PATH: ${{ inputs.zip_path }}
+        run: |
+          if [ ! -f "$ZIP_PATH" ]; then
+            echo "::error::ZIP not found: $ZIP_PATH"
+            echo "Upload the ZIP to this repository at the path entered in the workflow input."
+            exit 1
+          fi
+          case "$ZIP_PATH" in
+            *.zip) ;;
+            *) echo "::error::zip_path must end in .zip"; exit 1 ;;
+          esac
+
+      - name: Extract project ZIP
+        env:
+          ZIP_PATH: ${{ inputs.zip_path }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/project"
+          python3 - "$ZIP_PATH" "$RUNNER_TEMP/project" <<'PY'
+          import pathlib, sys, zipfile
+          archive = pathlib.Path(sys.argv[1])
+          destination = pathlib.Path(sys.argv[2]).resolve()
+          with zipfile.ZipFile(archive) as zf:
+              for item in zf.infolist():
+                  target = (destination / item.filename).resolve()
+                  if target != destination and destination not in target.parents:
+                      raise SystemExit(f"Unsafe ZIP path rejected: {item.filename}")
+              zf.extractall(destination)
+          print(f"Extracted {archive.name} into {destination}")
+          PY
+          echo "PROJECT_DIR=$RUNNER_TEMP/project" >> "$GITHUB_ENV"
+
+      - name: Locate Gradle project
+        run: |
+          # Support ZIPs that contain the project files at the root or in one nested folder.
+          if [ -f "$PROJECT_DIR/gradlew" ]; then
+            echo "BUILD_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          elif [ -f "$PROJECT_DIR/gradle/wrapper/gradle-wrapper.properties" ]; then
+            echo "BUILD_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          else
+            SETTINGS_FILE="$(find "$PROJECT_DIR" -maxdepth 4 -type f \( -name settings.gradle -o -name settings.gradle.kts \) -print -quit)"
+            if [ -z "$SETTINGS_FILE" ]; then
+              echo "::error::Could not find settings.gradle or settings.gradle.kts in the ZIP."
+              echo "The ZIP must contain a complete Android/Gradle project."
+              find "$PROJECT_DIR" -maxdepth 3 -type f | head -80
+              exit 1
+            fi
+            echo "BUILD_DIR=$(dirname "$SETTINGS_FILE")" >> "$GITHUB_ENV"
+          fi
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Build APK
+        env:
+          GRADLE_TASK: ${{ inputs.gradle_task }}
+        run: |
+          cd "$BUILD_DIR"
+          gradle "$GRADLE_TASK" --no-daemon
+
+      - name: Upload APK outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: |
+            ${{ env.BUILD_DIR }}/**/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+          retention-days: 14
