@@ -1,16 +1,20 @@
-name: Build Android APK from uploaded ZIP
+name: Build Android APK from ZIP
 
 on:
   workflow_dispatch:
     inputs:
       zip_path:
-        description: "Path to project ZIP in this repository (example: uploads/TikTokGlass-Starter.zip)"
-        required: true
-        default: "uploads/TikTokGlass-Starter.zip"
+        description: "Optional ZIP path in this repository; leave blank to auto-find the first ZIP"
+        required: false
+        default: ""
       gradle_task:
-        description: "Gradle task to run"
+        description: "Gradle task"
         required: true
         default: "assembleDebug"
+  push:
+    paths:
+      - "**.zip"
+      - ".github/workflows/build.yml"
 
 permissions:
   contents: read
@@ -19,29 +23,43 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Verify ZIP exists
+      - name: Find project ZIP
+        id: find_zip
+        shell: bash
         env:
-          ZIP_PATH: ${{ inputs.zip_path }}
+          ZIP_INPUT: ${{ inputs.zip_path }}
         run: |
-          if [ ! -f "$ZIP_PATH" ]; then
-            echo "::error::ZIP not found: $ZIP_PATH"
-            echo "Upload the ZIP to this repository at the path entered in the workflow input."
+          set -euo pipefail
+          if [ -n "${ZIP_INPUT:-}" ] && [ -f "$ZIP_INPUT" ]; then
+            SELECTED="$ZIP_INPUT"
+          else
+            SELECTED="$(find . -type f -iname '*.zip' \
+              -not -path './.git/*' \
+              -not -path './.github/*' \
+              -print -quit)"
+          fi
+
+          if [ -z "${SELECTED:-}" ] || [ ! -f "$SELECTED" ]; then
+            echo "::error::No ZIP found in the repository. Upload the ZIP to GitHub and commit it, then rerun this workflow."
+            echo "Files available in repository:"
+            find . -maxdepth 4 -type f | sort | head -100
             exit 1
           fi
-          case "$ZIP_PATH" in
-            *.zip) ;;
-            *) echo "::error::zip_path must end in .zip"; exit 1 ;;
-          esac
 
-      - name: Extract project ZIP
+          echo "Using ZIP: $SELECTED"
+          echo "zip_path=$SELECTED" >> "$GITHUB_OUTPUT"
+
+      - name: Extract project ZIP safely
+        shell: bash
         env:
-          ZIP_PATH: ${{ inputs.zip_path }}
+          ZIP_PATH: ${{ steps.find_zip.outputs.zip_path }}
         run: |
-          mkdir -p "$RUNNER_TEMP/project"
-          python3 - "$ZIP_PATH" "$RUNNER_TEMP/project" <<'PY'
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/android-project"
+          python3 - "$ZIP_PATH" "$RUNNER_TEMP/android-project" <<'PY'
           import pathlib, sys, zipfile
           archive = pathlib.Path(sys.argv[1])
           destination = pathlib.Path(sys.argv[2]).resolve()
@@ -51,27 +69,25 @@ jobs:
                   if target != destination and destination not in target.parents:
                       raise SystemExit(f"Unsafe ZIP path rejected: {item.filename}")
               zf.extractall(destination)
-          print(f"Extracted {archive.name} into {destination}")
+          print(f"Extracted {archive} into {destination}")
           PY
-          echo "PROJECT_DIR=$RUNNER_TEMP/project" >> "$GITHUB_ENV"
+          echo "PROJECT_ROOT=$RUNNER_TEMP/android-project" >> "$GITHUB_ENV"
 
-      - name: Locate Gradle project
+      - name: Find Android Gradle project
+        shell: bash
         run: |
-          # Support ZIPs that contain the project files at the root or in one nested folder.
-          if [ -f "$PROJECT_DIR/gradlew" ]; then
-            echo "BUILD_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          elif [ -f "$PROJECT_DIR/gradle/wrapper/gradle-wrapper.properties" ]; then
-            echo "BUILD_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          else
-            SETTINGS_FILE="$(find "$PROJECT_DIR" -maxdepth 4 -type f \( -name settings.gradle -o -name settings.gradle.kts \) -print -quit)"
-            if [ -z "$SETTINGS_FILE" ]; then
-              echo "::error::Could not find settings.gradle or settings.gradle.kts in the ZIP."
-              echo "The ZIP must contain a complete Android/Gradle project."
-              find "$PROJECT_DIR" -maxdepth 3 -type f | head -80
-              exit 1
-            fi
-            echo "BUILD_DIR=$(dirname "$SETTINGS_FILE")" >> "$GITHUB_ENV"
+          set -euo pipefail
+          SETTINGS="$(find "$PROJECT_ROOT" -maxdepth 6 -type f \
+            \( -name settings.gradle -o -name settings.gradle.kts \) \
+            -print -quit)"
+          if [ -z "$SETTINGS" ]; then
+            echo "::error::No settings.gradle or settings.gradle.kts found inside the ZIP. The ZIP must contain an Android Gradle project, not just an APK."
+            find "$PROJECT_ROOT" -maxdepth 4 -type f | sort | head -120
+            exit 1
           fi
+          BUILD_DIR="$(dirname "$SETTINGS")"
+          echo "BUILD_DIR=$BUILD_DIR" >> "$GITHUB_ENV"
+          echo "Android project found at: $BUILD_DIR"
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -82,8 +98,10 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install Android SDK packages
-        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - name: Install required Android SDK packages
+        run: |
+          sdkmanager --install "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+          yes | sdkmanager --licenses >/dev/null || true
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -91,13 +109,15 @@ jobs:
           gradle-version: "8.9"
 
       - name: Build APK
+        shell: bash
         env:
           GRADLE_TASK: ${{ inputs.gradle_task }}
         run: |
+          set -euo pipefail
           cd "$BUILD_DIR"
-          gradle "$GRADLE_TASK" --no-daemon
+          gradle "${GRADLE_TASK:-assembleDebug}" --no-daemon
 
-      - name: Upload APK outputs
+      - name: Upload generated APKs
         uses: actions/upload-artifact@v4
         with:
           name: android-apk
