@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       zip_path:
-        description: "Optional path to the Android project ZIP in this repository"
+        description: "Optional path to the Android project ZIP in this repository (leave blank to auto-detect)"
         required: false
         type: string
       gradle_task:
@@ -15,7 +15,7 @@ on:
   push:
     paths:
       - "**.zip"
-      - ".github/workflows/build.yml"
+      - ".github/workflows/build-apk.yml"
 
 permissions:
   contents: read
@@ -27,30 +27,45 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      # Do not enable setup-java's Gradle cache here: the project is inside a ZIP
-      # and has not been extracted yet, so the cache action cannot find Gradle files.
       - name: Set up Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      - name: Locate and extract Android project ZIP
+      - name: Locate and extract ZIP if present
+        id: project
         shell: bash
         env:
           ZIP_INPUT: ${{ inputs.zip_path }}
         run: |
           set -euo pipefail
-          if [[ -n "${ZIP_INPUT:-}" ]]; then
-            ZIP_FILE="$ZIP_INPUT"
-            [[ -f "$ZIP_FILE" ]] || { echo "::error::ZIP not found: $ZIP_FILE"; exit 1; }
-          else
-            ZIP_FILE="$(find . -maxdepth 5 -type f -name '*.zip' -print -quit)"
-            [[ -n "$ZIP_FILE" ]] || { echo "::error::No .zip file found in the repository. Add your Android project ZIP or set zip_path."; exit 1; }
+          # Prefer a Gradle project already checked into the repository root.
+          if [[ -z "${ZIP_INPUT:-}" && ( -f settings.gradle || -f settings.gradle.kts ) ]]; then
+            echo "project_dir=." >> "$GITHUB_OUTPUT"
+            echo "Using Android project at repository root."
+            exit 0
           fi
+
+          # Use the explicitly selected ZIP, or auto-detect one.
+          ZIP_FILE="${ZIP_INPUT:-}"
+          if [[ -n "$ZIP_FILE" && ! -f "$ZIP_FILE" ]]; then
+            echo "::error::ZIP not found: $ZIP_FILE"
+            exit 1
+          fi
+          if [[ -z "$ZIP_FILE" ]]; then
+            ZIP_FILE="$(find . -maxdepth 5 -type f -name '*.zip' -print -quit)"
+          fi
+          if [[ -z "$ZIP_FILE" ]]; then
+            echo "::error::No Gradle project found at repository root and no project ZIP found. Set zip_path or add the ZIP to the repository."
+            echo "Repository files:"
+            find . -maxdepth 4 -type f -print | head -150
+            exit 1
+          fi
+
           echo "Using ZIP: $ZIP_FILE"
-          mkdir -p project
-          python3 - "$ZIP_FILE" project <<'PY'
+          mkdir -p extracted
+          python3 - "$ZIP_FILE" extracted <<'PY'
           import sys, zipfile
           from pathlib import Path, PurePosixPath
           archive = Path(sys.argv[1])
@@ -67,52 +82,54 @@ jobs:
               zf.extractall(destination)
           PY
 
-          SETTINGS_FILE="$(find project -type f \( -name settings.gradle -o -name settings.gradle.kts \) -print -quit)"
+          SETTINGS_FILE="$(find extracted -type f \( -name settings.gradle -o -name settings.gradle.kts \) -print -quit)"
           if [[ -z "$SETTINGS_FILE" ]]; then
-            echo "::error::No settings.gradle or settings.gradle.kts found in the ZIP. The ZIP may not contain an Android/Gradle project."
-            echo "Files extracted (first 100):"
-            find project -maxdepth 5 -type f -print | head -100
+            echo "::error::No settings.gradle or settings.gradle.kts found in the ZIP."
+            find extracted -maxdepth 5 -type f -print | head -150
             exit 1
           fi
-
           PROJECT_DIR="$(dirname "$SETTINGS_FILE")"
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "Detected Gradle project directory: $PROJECT_DIR"
-          echo "Gradle files found:"
-          find "$PROJECT_DIR" -maxdepth 4 -type f \( -name '*.gradle' -o -name '*.gradle.kts' -o -name 'gradle-wrapper.properties' \) -print
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+          echo "Using extracted project at: $PROJECT_DIR"
 
       - name: Install Android SDK packages
         shell: bash
         run: |
           set -euo pipefail
           SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
-          echo "Using Android SDK at: $SDK_ROOT"
           SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -name sdkmanager -print -quit 2>/dev/null || true)"
           if [[ -z "$SDKMANAGER" ]]; then
             echo "::error::sdkmanager was not found under $SDK_ROOT/cmdline-tools"
-            find "$SDK_ROOT" -maxdepth 5 -type f -name sdkmanager -print || true
             exit 1
           fi
-          echo "Using sdkmanager: $SDKMANAGER"
           yes | "$SDKMANAGER" --licenses >/dev/null || true
           "$SDKMANAGER" --install "platform-tools" "platforms;android-35" "build-tools;35.0.0"
 
-      - name: Verify Gradle wrapper
+      - name: Verify Gradle project
         shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.project.outputs.project_dir }}
         run: |
           set -euo pipefail
           cd "$PROJECT_DIR"
-          if [[ ! -f gradlew || ! -f gradle/wrapper/gradle-wrapper.properties ]]; then
-            echo "::error::The extracted project must contain gradlew and gradle/wrapper/gradle-wrapper.properties."
-            echo "Project files:"
-            find . -maxdepth 5 -type f -print | head -150
+          if [[ ! -f settings.gradle && ! -f settings.gradle.kts ]]; then
+            echo "::error::settings.gradle(.kts) is missing."
             exit 1
           fi
+          if [[ ! -f gradlew || ! -f gradle/wrapper/gradle-wrapper.properties || ! -f gradle/wrapper/gradle-wrapper.jar ]]; then
+            echo "::error::Gradle wrapper is missing. Attempting to generate it with installed Gradle."
+            sudo apt-get update
+            sudo apt-get install -y gradle
+            gradle wrapper
+          fi
           chmod +x gradlew
+          test -f gradle/wrapper/gradle-wrapper.properties
+          test -f gradle/wrapper/gradle-wrapper.jar
 
       - name: Build APK
         shell: bash
         env:
+          PROJECT_DIR: ${{ steps.project.outputs.project_dir }}
           GRADLE_TASK: ${{ inputs.gradle_task || 'assembleDebug' }}
         run: |
           set -euo pipefail
@@ -124,6 +141,6 @@ jobs:
         with:
           name: android-apk
           path: |
-            project/**/build/outputs/apk/**/*.apk
+            **/build/outputs/apk/**/*.apk
           if-no-files-found: error
           retention-days: 7
